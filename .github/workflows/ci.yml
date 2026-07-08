@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Download dataset (if not cached)
+        run: |
+          mkdir -p data/raw
+          test -f data/raw/KDDTrain.txt || \
+            curl -s -o data/raw/KDDTrain.txt https://raw.githubusercontent.com/Jehuty4949/NSL_KDD/master/KDDTrain%2B.txt
+          test -f data/raw/KDDTest.txt || \
+            curl -s -o data/raw/KDDTest.txt https://raw.githubusercontent.com/Jehuty4949/NSL_KDD/master/KDDTest%2B.txt
+
+      - name: Train model (generates artifacts tests depend on)
+        run: python train_model.py
+
+      - name: Run tests
+        run: pytest api/tests/ -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -f Dockerfile.api -t nids-api:latest .
+
+      - name: Build Dashboard image
+        run: docker build -f Dockerfile.dashboard -t nids-dashboard:latest .

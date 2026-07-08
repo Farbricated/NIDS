@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir streamlit plotly pandas requests
+
+COPY dashboard/ ./dashboard/
+COPY data/__init__.py data/columns.py ./data/
+# Raw dataset (KDDTrain.txt / KDDTest.txt) is mounted at runtime via docker-compose volume,
+# not baked into the image, since it's a large data file.
+
+ENV NIDS_API_URL=http://api:8000
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
