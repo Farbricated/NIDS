@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# Secrets — never commit the real env file
+.env
+
 data/raw/*.txt
 models_store/*.pkl
 models_store/*.db

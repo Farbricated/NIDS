@@ -13,14 +13,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os
-import time
-from datetime import datetime
+import os  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime  # noqa: E402
 
-import pandas as pd
-import plotly.express as px
-import requests
-import streamlit as st
+import pandas as pd  # noqa: E402
+import plotly.express as px  # noqa: E402
+import requests  # noqa: E402
+import streamlit as st  # noqa: E402
 
 API_URL = os.environ.get("NIDS_API_URL", "http://localhost:8000")
 
