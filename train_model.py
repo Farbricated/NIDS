@@ -4,19 +4,31 @@ on the NSL-KDD dataset. Saves the best model + preprocessing artifacts
 to models_store/ for use by the API.
 
 Run: python train_model.py
+
+Outputs to models_store/metadata.json:
+  - all_results: accuracy/precision/recall/f1 per model (single train/test split)
+  - cv_scores: 5-fold cross-validation mean±std per model
+  - classification_report: per-class precision/recall/F1 for best model
+  - training_date: ISO timestamp
+  - dataset_hash: SHA-256 of KDDTrain.txt for reproducibility
+  - library_versions: scikit-learn, xgboost, numpy, pandas versions
 """
+import hashlib
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix,
-    f1_score, precision_score, recall_score
+    f1_score, precision_score, recall_score,
 )
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
@@ -32,6 +44,36 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data" / "raw"
 MODEL_DIR = BASE_DIR / "models_store"
 MODEL_DIR.mkdir(exist_ok=True)
+
+
+def _file_sha256(path: Path) -> str:
+    """Compute SHA-256 hash of a file for reproducibility tracking."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _library_versions() -> dict:
+    """Collect key library versions for the metadata record."""
+    import sklearn
+    import numpy as np_
+    import pandas as pd_
+    versions = {
+        "scikit-learn": sklearn.__version__,
+        "numpy": np_.__version__,
+        "pandas": pd_.__version__,
+    }
+    if HAS_XGB:
+        import xgboost as xgb
+        versions["xgboost"] = xgb.__version__
+    try:
+        import joblib as jl
+        versions["joblib"] = jl.__version__
+    except Exception:
+        pass
+    return versions
 
 
 def load_data():
@@ -71,6 +113,10 @@ def main():
     print("Class distribution (train):")
     print(train_df["category"].value_counts())
 
+    # Dataset hash for reproducibility
+    dataset_hash = _file_sha256(DATA_DIR / "KDDTrain.txt")
+    print(f"\nDataset SHA-256: {dataset_hash[:16]}...")
+
     encoders = build_preprocessors(train_df)
     train_df = apply_preprocessors(train_df, encoders)
     test_df = apply_preprocessors(test_df, encoders)
@@ -99,12 +145,16 @@ def main():
     }
     if HAS_XGB:
         models["xgboost"] = XGBClassifier(
-            n_estimators=150, max_depth=8, use_label_encoder=False,
+            n_estimators=150, max_depth=8,
             eval_metric="mlogloss", n_jobs=-1, random_state=42
         )
 
     results = {}
+    cv_scores = {}
     trained_models = {}
+
+    # 5-fold stratified cross-validation
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     for name, model in models.items():
         print(f"\nTraining {name}...")
@@ -131,6 +181,28 @@ def main():
         }
         trained_models[name] = model
         print(f"  Accuracy={acc:.4f}  F1={f1:.4f}  train_time={train_time:.2f}s")
+
+        # k-fold CV (use f1_weighted + accuracy)
+        print(f"  Running 5-fold CV for {name}...")
+        cv_result = cross_validate(
+            model.__class__(**model.get_params()),
+            X_train_scaled, y_train,
+            cv=cv,
+            scoring=["accuracy", "f1_weighted"],
+            n_jobs=-1,
+        )
+        cv_scores[name] = {
+            "cv_accuracy_mean": round(float(np.mean(cv_result["test_accuracy"])), 4),
+            "cv_accuracy_std": round(float(np.std(cv_result["test_accuracy"])), 4),
+            "cv_f1_mean": round(float(np.mean(cv_result["test_f1_weighted"])), 4),
+            "cv_f1_std": round(float(np.std(cv_result["test_f1_weighted"])), 4),
+        }
+        print(
+            f"  CV accuracy={cv_scores[name]['cv_accuracy_mean']:.4f}"
+            f"±{cv_scores[name]['cv_accuracy_std']:.4f}  "
+            f"F1={cv_scores[name]['cv_f1_mean']:.4f}"
+            f"±{cv_scores[name]['cv_f1_std']:.4f}"
+        )
 
     best_name = max(results, key=lambda n: results[n]["f1_score"])
     best_model = trained_models[best_name]
@@ -164,17 +236,24 @@ def main():
     metadata = {
         "best_model": best_name,
         "all_results": results,
+        "cv_scores": cv_scores,
         "classification_report": report,
         "confusion_matrix": cm,
         "class_names": label_encoder.classes_.tolist(),
         "feature_importance": feature_importance,
         "feature_columns": feature_cols,
+        # Reproducibility metadata
+        "training_date": datetime.now(timezone.utc).isoformat(),
+        "dataset_hash": dataset_hash,
+        "library_versions": _library_versions(),
     }
     with open(MODEL_DIR / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     print(f"\nArtifacts saved to {MODEL_DIR}/")
     print(json.dumps(results, indent=2))
+    print("\n5-fold Cross-Validation Results:")
+    print(json.dumps(cv_scores, indent=2))
 
 
 if __name__ == "__main__":

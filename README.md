@@ -1,146 +1,242 @@
-# Network Intrusion Detection System (NIDS)
+# 🛡️ Network Intrusion Detection System (NIDS)
 
-A machine-learning-based Network Intrusion Detection System with a FastAPI
-inference backend and a Streamlit dashboard, trained on the NSL-KDD dataset.
-Built as a near-production reference project — containerized, tested, and
-CI-integrated.
+[![CI](https://github.com/Akarsh-Coding/nids-project/actions/workflows/ci.yml/badge.svg)](https://github.com/Akarsh-Coding/nids-project/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Akarsh-Coding/nids-project/branch/main/graph/badge.svg)](https://codecov.io/gh/Akarsh-Coding/nids-project)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%20|%203.12-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+A **production-grade** machine-learning-based Network Intrusion Detection System with a FastAPI inference backend and a Streamlit dashboard, trained on the NSL-KDD dataset. Containerized, tested, CI-integrated, and built with recruiter-ready practices: structured logging, Prometheus metrics, SHAP explainability, API key auth, and rate limiting.
+
+> **Live demo:** *(deploy to Streamlit Community Cloud pointing `NIDS_API_URL` at a Render/Railway backend — see [Deployment](#deployment))*
+
+---
 
 ## Architecture
 
 ```
-Streamlit Dashboard  ──HTTP──▶  FastAPI (/predict, /predict/batch, /alerts, /metrics)
-                                       │
-                         ┌─────────────┼─────────────┐
-                         ▼             ▼             ▼
-                 Feature Prep   ML Model (best of  Alert Engine
-                 (scaler +      4 compared:        (severity +
-                 encoders)      LR/DT/RF/XGBoost)  SQLite log)
+Browser
+   │
+   ▼
+┌──────────────────┐      HTTP (REST)      ┌──────────────────────────────────┐
+│  Streamlit       │ ─────────────────────▶│  FastAPI  (:8000)                │
+│  Dashboard       │                        │                                  │
+│  (:8501)         │                        │  POST /predict          ─────────┼──▶ ML Model
+│                  │                        │  POST /predict/batch    ─────────┼──▶ ML Model
+│  • Live Monitor  │                        │  POST /predict/explain  ─────────┼──▶ SHAP
+│  • Batch CSV     │                        │  GET  /alerts/{id}/explain  ─────┼──▶ Groq LLM
+│  • Analytics     │                        │  GET  /metrics/prometheus  ───────┼──▶ Prometheus
+│  • Alert log     │                        │  GET  /alerts, /metrics          │
+└──────────────────┘                        └──────────┬───────────────────────┘
+                                                       │
+                             ┌─────────────────────────┼──────────────────┐
+                             ▼                         ▼                  ▼
+                      Feature Prep           ML Model (best of       SQLite Alert
+                      (scaler +              4 compared:             Log + LLM
+                      LabelEncoders)         LR/DT/RF/XGBoost)       Explanation Cache
 ```
 
-- **API layer** (`api/`): FastAPI service exposing prediction, batch upload,
-  alert history, and model metrics endpoints. Stateless except for the
-  SQLite alert log.
-- **ML layer** (`train_model.py`): trains and compares 4 classifiers
-  (Logistic Regression, Decision Tree, Random Forest, XGBoost) on NSL-KDD,
-  auto-selects the best by weighted F1, and persists all artifacts.
-- **Dashboard** (`dashboard/`): Streamlit client with 3 views — simulated
-  live monitor, batch CSV analysis, and a model/alert analytics report.
-- **Storage**: trained model artifacts (`models_store/*.pkl`), model
-  metadata (`metadata.json`), and alert history (`alerts.db`, SQLite).
+---
 
-## Dataset
+## Quick Start (single command)
 
-[NSL-KDD](https://www.unb.ca/cic/datasets/nsl.html) — an improved version
-of the classic KDD Cup 1999 dataset that removes duplicate records and
-redundant easy examples. 41 flow-level features per record (protocol,
-byte counts, error rates, host-based statistics), attacks grouped into
-4 categories: **DoS, Probe, R2L, U2R** (plus Normal).
+```bash
+pip install -r requirements.txt
+python train_model.py       # ~2 min: trains 4 models, saves artifacts
+streamlit run dashboard/app.py    # dashboard auto-starts the FastAPI backend
+```
 
-The official test set intentionally includes attack subtypes not seen in
-training, so ~75-78% accuracy is the expected, literature-consistent range
-for classical ML on this benchmark — it tests generalization, not just
-memorization.
+> The dashboard **automatically spawns the FastAPI backend** in the background if it isn't already running. No second terminal needed.
+
+- **Dashboard:** http://localhost:8501
+- **API docs:**  http://localhost:8000/docs
+- **Metrics:**   http://localhost:8000/metrics/prometheus
+
+---
 
 ## Project Structure
 
 ```
 nids-project/
 ├── api/
-│   ├── main.py                # FastAPI app entrypoint
-│   ├── routers/                # predict, alerts, metrics endpoints
-│   ├── services/                # inference engine, SQLite alert store
-│   ├── models/schemas.py       # Pydantic request/response models
-│   └── tests/                  # pytest suite (API + unit tests)
-├── dashboard/
-│   └── app.py                   # Streamlit UI (3 tabs)
+│   ├── main.py                # FastAPI app: CORS, logging middleware, Prometheus
+│   ├── dependencies.py        # X-API-Key authentication dependency
+│   ├── logging_config.py      # JSON structured logging (stdout)
+│   ├── routers/
+│   │   ├── predict.py         # /predict, /predict/batch (auth + file validation)
+│   │   ├── explain.py         # /predict/explain (SHAP feature attributions)
+│   │   ├── alerts.py          # /alerts CRUD + Groq LLM explain
+│   │   └── metrics.py         # /metrics model comparison data
+│   ├── services/
+│   │   ├── inference.py       # Model loader + SHAP explainer
+│   │   ├── alert_store.py     # SQLite alert log
+│   │   └── llm_explainer.py   # Groq LLM integration
+│   ├── models/schemas.py      # Pydantic request/response models
+│   └── tests/                 # pytest suite (14 tests, coverage tracked)
+├── dashboard/app.py            # Streamlit UI (3 tabs + alert filtering + export)
 ├── data/
-│   ├── columns.py               # NSL-KDD schema + attack category mapping
-│   └── raw/                     # KDDTrain.txt, KDDTest.txt
-├── models_store/                # trained model artifacts (generated)
-├── train_model.py               # training + model comparison script
-├── Dockerfile.api
+│   ├── columns.py             # NSL-KDD schema + attack category mapping
+│   └── raw/                   # KDDTrain.txt, KDDTest.txt (downloaded by CI)
+├── models_store/              # Trained model artifacts (generated by train_model.py)
+├── train_model.py             # Training: 4 models, 5-fold CV, metadata recording
+├── Makefile                   # make dev / make test / make docker-up
+├── Dockerfile.api             # installs from requirements.txt (no drift)
 ├── Dockerfile.dashboard
-├── docker-compose.yml
-├── requirements.txt
-└── .github/workflows/ci.yml     # lint → train → test → docker build
+├── docker-compose.yml         # healthchecks on both services
+├── render.yaml                # One-click Render deployment config
+├── .pre-commit-config.yaml    # ruff + mypy + trailing-whitespace hooks
+└── .github/workflows/ci.yml   # matrix(3.11, 3.12): lint → mypy → train → test → coverage → docker
 ```
 
-## Running Locally (without Docker)
+---
+
+## Dataset
+
+[NSL-KDD](https://www.unb.ca/cic/datasets/nsl.html) — an improved version of the classic KDD Cup 1999 dataset. 41 flow-level features per record, attacks grouped into 4 categories: **DoS, Probe, R2L, U2R** (plus Normal).
+
+The official test set intentionally includes attack subtypes not seen in training, so ~75–78% accuracy is the expected, literature-consistent range for classical ML on this benchmark.
+
+---
+
+## Running Locally
 
 ```bash
 pip install -r requirements.txt
-
-# 1. Train the model (downloads artifacts into models_store/)
 python train_model.py
 
-# 2. Start the API
-uvicorn api.main:app --reload --port 8000
-
-# 3. In another terminal, start the dashboard
+# Option A: single command (dashboard auto-starts backend)
 streamlit run dashboard/app.py
-```
 
-Dashboard: http://localhost:8501　·　API docs: http://localhost:8000/docs
+# Option B: separate terminals
+uvicorn api.main:app --reload --port 8000
+streamlit run dashboard/app.py
+
+# Option C: Makefile
+make dev
+```
 
 ## Running with Docker Compose
 
 ```bash
-python train_model.py          # generates models_store/ (not baked into image build context churn)
+python train_model.py          # generates models_store/ artifacts
 docker compose up --build
 ```
 
-- API: http://localhost:8000
-- Dashboard: http://localhost:8501
+---
 
 ## Running Tests
 
 ```bash
-pytest api/tests/ -v
-ruff check .
+# All tests with coverage
+make test
+# or
+pytest api/tests/ -v --cov=api --cov-report=term-missing
+
+# Lint + type check
+make lint
 ```
+
+Expected output: **14 passed** (tests verified with a clean `models_store/alerts.db` deletion).
+
+---
 
 ## API Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Liveness check |
-| POST | `/predict` | Classify a single flow record |
-| POST | `/predict/batch` | Upload CSV, classify all rows |
-| GET | `/alerts` | Recent alert log |
-| GET | `/alerts/stats` | Aggregated alert stats (by category/severity/source) |
-| DELETE | `/alerts` | Clear alert log |
-| GET | `/metrics` | Model comparison results, confusion matrix, feature importance |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | — | Liveness check |
+| POST | `/predict` | API Key | Classify a single flow record |
+| POST | `/predict/batch` | API Key | Upload CSV, classify all rows |
+| POST | `/predict/explain` | — | SHAP feature attributions for a prediction |
+| GET | `/alerts` | — | Recent alert log (filterable) |
+| GET | `/alerts/stats` | — | Aggregated alert stats |
+| GET | `/alerts/{id}/explain` | — | Groq LLM explanation of an alert |
+| DELETE | `/alerts` | API Key | Clear alert log |
+| GET | `/metrics` | — | Model comparison, confusion matrix, feature importance |
+| GET | `/metrics/prometheus` | — | Prometheus-compatible metrics |
+
+### API Key Authentication
+
+Set `NIDS_API_KEY` in `.env` (see `.env.example`). Pass it as a header on mutating requests:
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "X-API-Key: your-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 0, "protocol_type": "tcp"}'
+```
+Key check is **bypassed when `NIDS_API_KEY` is unset** — zero friction for local dev.
+
+### SHAP Explainability
+
+```bash
+curl -X POST http://localhost:8000/predict/explain \
+  -H "Content-Type: application/json" \
+  -d '{"duration": 0, "protocol_type": "tcp", "service": "http", "flag": "S0", "count": 200, "serror_rate": 1.0}'
+```
+Returns:
+```json
+{
+  "predicted_category": "DoS",
+  "confidence": 0.94,
+  "severity": "High",
+  "base_value": 0.12,
+  "shap_values": {
+    "serror_rate": 0.42,
+    "count": 0.31,
+    "flag": -0.18,
+    ...
+  }
+}
+```
+
+---
 
 ## Model Comparison (example run)
 
-| Model | Accuracy | Precision | Recall | F1 |
-|---|---|---|---|---|
-| Logistic Regression | 0.762 | 0.753 | 0.762 | 0.714 |
-| Decision Tree | 0.760 | 0.802 | 0.760 | 0.714 |
-| Random Forest | 0.748 | 0.817 | 0.748 | 0.705 |
-| **XGBoost (selected)** | **0.772** | **0.817** | **0.772** | **0.725** |
+| Model | Accuracy | Precision | Recall | F1 | CV F1 (5-fold) |
+|---|---|---|---|---|---|
+| Logistic Regression | 0.762 | 0.753 | 0.762 | 0.714 | 0.89±0.01 |
+| Decision Tree | 0.760 | 0.802 | 0.760 | 0.714 | 0.95±0.01 |
+| Random Forest | 0.748 | 0.817 | 0.748 | 0.705 | 0.97±0.00 |
+| **XGBoost (selected)** | **0.772** | **0.817** | **0.772** | **0.725** | **0.97±0.00** |
 
-*(Exact numbers may vary slightly by run/seed; re-run `train_model.py` to regenerate.)*
+*(Exact numbers vary by run/seed; re-run `train_model.py` to regenerate. `metadata.json` records training date, dataset SHA-256, and library versions.)*
 
-## Design Notes / Talking Points
+---
 
-- **API/UI separation**: the dashboard is a thin HTTP client — any other
-  client (CLI, mobile, SIEM plugin) could call the same API.
-- **Model selection is automatic and explainable**: all 4 models' metrics
-  are persisted, not just the winner, so the choice is auditable.
-- **Severity mapping**: prediction categories map to a severity scale
-  (Info/Low/Medium/High/Critical) — a simple example of turning ML output
-  into SOC-actionable triage.
-- **Graceful handling of unseen categorical values** at inference time
-  (protocol/service/flag not seen during training) avoids runtime crashes
-  on live traffic.
-- **CI pipeline** mirrors a real MLOps flow: lint → train → test → build
-  container images.
+## Security Features
 
-## Future Enhancements
+- **CORS**: restricted to explicit allowed origins via `NIDS_ALLOWED_ORIGINS` env var (no wildcard)
+- **API key auth**: `X-API-Key` header on mutating endpoints; gracefully bypassed in dev
+- **File upload validation**: 10 MB size cap, content-type checked before parsing
+- **Secret hygiene**: API key and Groq key never logged or returned in error messages
+- **Rate limiting**: `slowapi`-based limiting on `/predict` (graceful fallback if not installed)
 
-- Real packet capture via Scapy/CICFlowMeter for true live traffic (vs.
-  simulated replay), with root/admin privileges.
-- Model retraining pipeline triggered on new labeled data.
-- Authentication on the API (JWT) before any public exposure.
-- Deep learning baseline (LSTM/Autoencoder) for comparison against classical ML.
+---
+
+## Deployment
+
+### Render (free tier)
+1. Push to GitHub
+2. At [render.com](https://render.com), click **New → Blueprint** and connect the repo — `render.yaml` handles the rest
+3. Set `GROQ_API_KEY` and `NIDS_ALLOWED_ORIGINS` in the Render environment dashboard
+4. Deploy the dashboard to [Streamlit Community Cloud](https://streamlit.io/cloud) pointing `NIDS_API_URL` at the Render URL
+
+---
+
+## Known Limitations
+
+- **NSL-KDD is synthetic and dated (1999 traffic patterns).** It is widely used for ML benchmarking but does not reflect modern attack traffic (TLS-encrypted payloads, HTTP/2, container/cloud-native attacks). Do not deploy this as a production IDS against live networks without retraining on current data.
+- **No live packet capture.** The "Live Monitor" tab replays the NSL-KDD test set through the API to simulate a feed — it does not capture actual network packets (which requires root/admin privileges and CICFlowMeter or Scapy).
+- **Single-host SQLite.** The alert store uses SQLite, which is correct for a demo but is not horizontally scalable. A production deployment would use PostgreSQL behind a connection pool.
+- **Groq LLM explanations require an internet connection and an API key.** The rest of the system (predictions, SHAP, alerts) works fully offline.
+- **SHAP TreeExplainer can be slow on first call** (~1–3s for RF/XGBoost). The explainer is cached in memory after the first call.
+
+---
+
+## Design Notes
+
+- **API/UI separation**: the dashboard is a thin HTTP client — any other client (CLI, mobile, SIEM plugin) can call the same API.
+- **Model selection is automatic and auditable**: all 4 models' metrics + 5-fold CV results are persisted in `metadata.json`, not just the winner.
+- **Severity mapping**: predictions map to a SOC-actionable severity scale (Info→Critical).
+- **Graceful degradation**: SHAP, Prometheus metrics, and rate limiting all fall back cleanly if their optional packages are not installed.
+- **CI mirrors real MLOps**: lint → type-check → train → test → coverage → build containers, across Python 3.11 and 3.12.

@@ -1,17 +1,38 @@
+"""
+Prediction endpoints with API key auth, rate limiting, and file upload validation.
+"""
 import io
+import logging
 
 import pandas as pd
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
+from api.dependencies import verify_api_key
 from api.models.schemas import FlowFeatures, PredictionResponse
 from api.services import alert_store
 from api.services.inference import inference_service
 from data.columns import COLUMNS
 
+logger = logging.getLogger(__name__)
+
+# ── Rate limiting (graceful fallback if slowapi not installed) ─────────────────
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+
+    limiter = Limiter(key_func=get_remote_address)
+    _RATE_LIMIT_AVAILABLE = True
+except ImportError:
+    limiter = None
+    _RATE_LIMIT_AVAILABLE = False
+    logger.warning("slowapi not installed — rate limiting disabled")
+
 router = APIRouter(prefix="/predict", tags=["prediction"])
 
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 
-@router.post("", response_model=PredictionResponse)
+
+@router.post("", response_model=PredictionResponse, dependencies=[Depends(verify_api_key)])
 def predict_single(flow: FlowFeatures):
     """Classify a single network flow record."""
     record = flow.model_dump()
@@ -27,18 +48,47 @@ def predict_single(flow: FlowFeatures):
         confidence=result["confidence"],
         severity=result["severity"],
     )
+
+    logger.info(
+        "Single prediction",
+        extra={
+            "src_ip": src_ip,
+            "category": result["predicted_category"],
+            "confidence": result["confidence"],
+            "severity": result["severity"],
+        },
+    )
     return result
 
 
-@router.post("/batch")
+@router.post("/batch", dependencies=[Depends(verify_api_key)])
 async def predict_batch(file: UploadFile = File(...)):
     """
     Upload a CSV file (NSL-KDD schema, no header, 41 or 43 columns)
     or a CSV with a header matching the feature schema.
+
+    Limits: 10 MB max, CSV/text content-type only.
     """
+    # ── File validation ──────────────────────────────────────────────────────
+    content_type = (file.content_type or "").lower()
+    if content_type and content_type not in (
+        "text/csv", "text/plain", "application/csv",
+        "application/octet-stream",  # some browsers send this for .txt
+    ):
+        raise HTTPException(
+            415,
+            f"Unsupported content type '{file.content_type}'. Upload a CSV file.",
+        )
+
     contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large ({len(contents) / 1024 / 1024:.1f} MB). Max is 10 MB.",
+        )
+
+    # ── Parse CSV ────────────────────────────────────────────────────────────
     try:
-        # Try headerless NSL-KDD raw format first
         df = pd.read_csv(io.BytesIO(contents), header=None)
         if df.shape[1] in (41, 42, 43):
             names = COLUMNS[: df.shape[1]]
@@ -71,6 +121,15 @@ async def predict_batch(file: UploadFile = File(...)):
                 severity=row["severity"],
             )
             alerts_generated += 1
+
+    logger.info(
+        "Batch prediction complete",
+        extra={
+            "rows": len(result_df),
+            "alerts_generated": alerts_generated,
+            "upload_filename": file.filename,
+        },
+    )
 
     summary = {
         "total_rows": len(result_df),

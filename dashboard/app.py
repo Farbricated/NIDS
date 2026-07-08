@@ -1,6 +1,7 @@
 """
 NIDS Dashboard — Streamlit client for the FastAPI-based detection API.
 Run: streamlit run dashboard/app.py
+The dashboard will automatically start the FastAPI backend if it isn't already running.
 """
 # ── sys.path fix ──────────────────────────────────────────────────────────────
 # Streamlit sets sys.path[0] to the script's own directory (dashboard/), so
@@ -14,8 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 import pandas as pd  # noqa: E402
 import plotly.express as px  # noqa: E402
@@ -24,7 +28,96 @@ import streamlit as st  # noqa: E402
 
 API_URL = os.environ.get("NIDS_API_URL", "http://localhost:8000")
 
+# ── Backend auto-start ────────────────────────────────────────────────────────
+
+def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Return True if something is already listening on host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_backend_running() -> None:
+    """
+    Spawn the FastAPI backend automatically if it isn't already running.
+
+    - Only auto-spawns when the API_URL points to localhost (skips if NIDS_API_URL
+      is set to a remote address — Docker, Render, etc.).
+    - Idempotent: port-check gates the spawn, so repeated Streamlit reruns never
+      create duplicate uvicorn processes.
+    - Shows a spinner while waiting for /health to respond (up to 15 s).
+    - Shows a clear st.error with stderr tail if it never comes up.
+    """
+    parsed = urlparse(API_URL)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 8000
+
+    # Don't auto-spawn for remote URLs (Docker, cloud deployments).
+    if host not in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return
+
+    # If port is already bound (API already running), nothing to do.
+    if _is_port_open(host, port):
+        return
+
+    # Spawn uvicorn as a background process that survives Streamlit reruns.
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "uvicorn",
+            "api.main:app",
+            "--host", "0.0.0.0",
+            "--port", str(port),
+        ],
+        cwd=str(PROJECT_ROOT),
+        start_new_session=True,          # detach from Streamlit's process group
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Poll /health until it responds 200 or we time out (~15 s).
+    deadline = time.time() + 15
+    started = False
+    with st.spinner("🚀 Starting NIDS backend..."):
+        while time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                r = requests.get(f"{API_URL}/health", timeout=2)
+                if r.status_code == 200:
+                    started = True
+                    break
+            except Exception:
+                pass
+
+    if started:
+        st.toast("✅ Backend started automatically.", icon="🛡️")
+    else:
+        # Try to surface stderr for a clear error message.
+        try:
+            _, stderr_bytes = proc.communicate(timeout=1)
+            err_tail = stderr_bytes.decode(errors="replace")[-800:]
+        except Exception:
+            err_tail = "(could not read stderr)"
+        st.error(
+            "❌ **Could not start the NIDS backend** within 15 seconds.\n\n"
+            "Make sure you have run `python train_model.py` first, then try:\n"
+            "```\nuvicorn api.main:app --port 8000\n```\n\n"
+            f"**Backend stderr (tail):**\n```\n{err_tail}\n```"
+        )
+
+
+# st.set_page_config() MUST be the very first Streamlit command executed in the
+# script (Streamlit enforces this at runtime). ensure_backend_running() calls
+# st.spinner/st.toast/st.error internally, so set_page_config has to run first —
+# calling it after caused a StreamlitSetPageConfigMustBeFirstCommandError crash
+# on first-ever launch (the exact scenario auto-start exists for).
 st.set_page_config(page_title="NIDS Dashboard", page_icon="🛡️", layout="wide")
+
+# Run once per page load — idempotent due to port check inside.
+ensure_backend_running()
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 SEVERITY_COLORS = {
     "Critical": "#d32f2f", "High": "#f57c00", "Medium": "#fbc02d",
@@ -32,9 +125,22 @@ SEVERITY_COLORS = {
 }
 
 
+# If NIDS_API_KEY is set (same var the API's verify_api_key dependency checks),
+# attach it automatically so enabling API auth doesn't lock the dashboard itself out.
+_DASHBOARD_API_KEY = os.environ.get("NIDS_API_KEY", "").strip() or None
+
+
+def _with_auth_headers(kwargs: dict) -> dict:
+    if _DASHBOARD_API_KEY:
+        headers = kwargs.pop("headers", {}) or {}
+        headers["X-API-Key"] = _DASHBOARD_API_KEY
+        kwargs["headers"] = headers
+    return kwargs
+
+
 def api_get(path, **kwargs):
     try:
-        r = requests.get(f"{API_URL}{path}", timeout=10, **kwargs)
+        r = requests.get(f"{API_URL}{path}", timeout=10, **_with_auth_headers(kwargs))
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -44,7 +150,7 @@ def api_get(path, **kwargs):
 
 def api_post(path, **kwargs):
     try:
-        r = requests.post(f"{API_URL}{path}", timeout=30, **kwargs)
+        r = requests.post(f"{API_URL}{path}", timeout=30, **_with_auth_headers(kwargs))
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -71,13 +177,20 @@ with tab1:
         "This avoids needing raw packet capture privileges on your laptop."
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         speed = st.slider("Flows per tick", 1, 20, 5)
     with col2:
         delay = st.slider("Delay per tick (sec)", 0.1, 3.0, 0.5)
     with col3:
         n_flows = st.number_input("Total flows to replay", 10, 2000, 100)
+    with col4:
+        refresh_interval = st.selectbox(
+            "Auto-refresh interval",
+            options=["Off", "5s", "10s", "30s", "60s"],
+            index=0,
+            help="Auto-refresh the monitor at this interval (separate from stream tick).",
+        )
 
     if "streaming" not in st.session_state:
         st.session_state.streaming = False
@@ -162,6 +275,14 @@ with tab1:
             st.session_state.streaming = False
             st.info("Stream finished. Adjust settings and start again.")
 
+    # Auto-refresh logic (outside the streaming block)
+    if refresh_interval != "Off" and not st.session_state.streaming:
+        interval_map = {"5s": 5, "10s": 10, "30s": 30, "60s": 60}
+        secs = interval_map.get(refresh_interval, 0)
+        if secs:
+            time.sleep(secs)
+            st.rerun()
+
 # ─────────────────────────────────────────────────────────────
 # TAB 2: BATCH ANALYSIS
 # ─────────────────────────────────────────────────────────────
@@ -209,9 +330,25 @@ with tab3:
     if metadata:
         st.markdown(f"**Best Model Selected:** `{metadata['best_model']}`")
 
+        # Show training metadata if available
+        meta_cols = st.columns(3)
+        if metadata.get("training_date"):
+            meta_cols[0].metric("Training Date", metadata["training_date"][:10])
+        if metadata.get("library_versions", {}).get("scikit-learn"):
+            meta_cols[1].metric("scikit-learn", metadata["library_versions"]["scikit-learn"])
+        if metadata.get("dataset_hash"):
+            meta_cols[2].metric("Dataset Hash", metadata["dataset_hash"][:8] + "…")
+
         results_df = pd.DataFrame(metadata["all_results"]).T.reset_index()
         results_df.rename(columns={"index": "model"}, inplace=True)
         st.dataframe(results_df, use_container_width=True)
+
+        # Cross-validation results
+        if metadata.get("cv_scores"):
+            st.subheader("Cross-Validation Results (5-fold)")
+            cv_df = pd.DataFrame(metadata["cv_scores"]).T.reset_index()
+            cv_df.rename(columns={"index": "model"}, inplace=True)
+            st.dataframe(cv_df, use_container_width=True)
 
         fig = px.bar(
             results_df, x="model", y=["accuracy", "precision", "recall", "f1_score"],
@@ -260,20 +397,61 @@ with tab3:
             st.markdown("**Top Attacking Source IPs**")
             st.dataframe(pd.DataFrame(stats["top_sources"]), use_container_width=True)
 
-    recent = api_get("/alerts?limit=50")
-    if recent:
-        st.markdown("**Recent Alerts (last 50)**")
+    # ── Alert filtering ──────────────────────────────────────────────────────
+    recent_all = api_get("/alerts?limit=500")
+    if recent_all:
+        st.markdown("**Recent Alerts (filterable)**")
         st.caption(
             "Click **Explain** on any alert to get an AI-generated explanation "
             "of why the traffic looks malicious (powered by Groq LLM)."
         )
-        for row in recent:
+
+        # Build filter widgets
+        all_severities = sorted({r.get("severity", "") for r in recent_all if r.get("severity")})
+        all_categories = sorted({r.get("predicted_category", "") for r in recent_all if r.get("predicted_category")})
+
+        fcol1, fcol2, fcol3 = st.columns(3)
+        with fcol1:
+            filter_severity = st.multiselect(
+                "Filter by Severity", options=all_severities, default=all_severities,
+                key="filter_severity"
+            )
+        with fcol2:
+            filter_category = st.multiselect(
+                "Filter by Category", options=all_categories, default=all_categories,
+                key="filter_category"
+            )
+        with fcol3:
+            filter_ip = st.text_input("Filter by Source IP (partial match)", key="filter_ip")
+
+        # Apply filters
+        recent = [
+            r for r in recent_all
+            if r.get("severity") in filter_severity
+            and r.get("predicted_category") in filter_category
+            and (not filter_ip or filter_ip.lower() in (r.get("src_ip") or "").lower())
+        ]
+
+        st.caption(f"Showing {len(recent)} of {len(recent_all)} alerts")
+
+        # CSV export of filtered results
+        if recent:
+            export_df = pd.DataFrame(recent)
+            csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️ Download filtered alerts (CSV)",
+                data=csv_bytes,
+                file_name=f"nids_alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_alerts",
+            )
+
+        for row in recent[:50]:  # display cap to avoid UI freeze
             alert_id = row.get("id", "?")
             category = row.get("predicted_category", "Unknown")
             severity = row.get("severity", "")
             src_ip = row.get("src_ip", "")
             ts = row.get("timestamp", "")[:19].replace("T", " ")
-            # Colour-code severity in the expander label
             sev_icon = {
                 "Critical": "🔴", "High": "🟠", "Medium": "🟡",
                 "Low": "🟢", "Info": "🔵",
@@ -305,6 +483,8 @@ with tab3:
                             )
 
     if st.button("🗑️ Clear Alert Log"):
-        requests.delete(f"{API_URL}/alerts")
+        try:
+            requests.delete(f"{API_URL}/alerts", **_with_auth_headers({}), timeout=10)
+        except Exception as e:
+            st.error(f"API error (/alerts DELETE): {e}")
         st.rerun()
-

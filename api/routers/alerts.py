@@ -1,7 +1,16 @@
-from fastapi import APIRouter, HTTPException, Query
+"""
+Alert management endpoints — list, stats, explain, and clear.
+DELETE /alerts requires API key; read endpoints are public.
+"""
+import logging
 
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from api.dependencies import verify_api_key
 from api.services import alert_store
 from api.services import llm_explainer
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -33,27 +42,33 @@ def explain_alert(alert_id: int):
 
     # Return cached explanation if already generated
     if alert.get("explanation"):
+        logger.info("Returning cached Groq explanation", extra={"alert_id": alert_id})
         return {"alert_id": alert_id, "explanation": alert["explanation"], "cached": True}
 
     # Call Groq LLM
+    logger.info("Calling Groq LLM for explanation", extra={"alert_id": alert_id})
     try:
         explanation = llm_explainer.explain_alert(alert)
     except RuntimeError as exc:
-        # Missing API key or missing package — config error
+        # Missing API key or missing package — config error (don't log key value)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         # Network error, rate limit, etc.
+        logger.error("Groq API call failed", extra={"alert_id": alert_id, "error": type(exc).__name__})
         raise HTTPException(
             status_code=502,
-            detail=f"Groq API error: {exc}",
+            detail=f"Groq API error: {type(exc).__name__}",
         ) from exc
 
     # Persist and return
     alert_store.set_alert_explanation(alert_id, explanation)
+    logger.info("Groq explanation generated and cached", extra={"alert_id": alert_id})
     return {"alert_id": alert_id, "explanation": explanation, "cached": False}
 
 
-@router.delete("")
+@router.delete("", dependencies=[Depends(verify_api_key)])
 def clear_alerts():
+    """Clear all alerts from the database. Requires API key."""
     alert_store.clear_alerts()
+    logger.warning("Alert log cleared by API request")
     return {"status": "cleared"}

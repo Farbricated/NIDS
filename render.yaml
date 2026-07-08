@@ -1,0 +1,22 @@
+services:
+  # FastAPI backend — deploy on Render (free tier)
+  - type: web
+    name: nids-api
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      python train_model.py
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: NIDS_ALLOWED_ORIGINS
+        sync: false  # Set in Render dashboard to your Streamlit Cloud URL
+      - key: NIDS_API_KEY
+        generateValue: true  # Auto-generate a secure key
+      - key: GROQ_API_KEY
+        sync: false  # Set in Render dashboard from console.groq.com
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+    healthCheckPath: /health
