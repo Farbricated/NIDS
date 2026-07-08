@@ -2,6 +2,17 @@
 NIDS Dashboard — Streamlit client for the FastAPI-based detection API.
 Run: streamlit run dashboard/app.py
 """
+# ── sys.path fix ──────────────────────────────────────────────────────────────
+# Streamlit sets sys.path[0] to the script's own directory (dashboard/), so
+# sibling packages like `data/` are not importable without this fix.
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+# ──────────────────────────────────────────────────────────────────────────────
+
 import os
 import time
 from datetime import datetime
@@ -86,7 +97,7 @@ with tab1:
     if st.session_state.streaming:
         try:
             sample_df = pd.read_csv(
-                "data/raw/KDDTest.txt", header=None, nrows=2000
+                PROJECT_ROOT / "data" / "raw" / "KDDTest.txt", header=None, nrows=2000
             )
             from data.columns import COLUMNS
             sample_df.columns = COLUMNS[: sample_df.shape[1]]
@@ -252,8 +263,48 @@ with tab3:
     recent = api_get("/alerts?limit=50")
     if recent:
         st.markdown("**Recent Alerts (last 50)**")
-        st.dataframe(pd.DataFrame(recent), use_container_width=True)
+        st.caption(
+            "Click **Explain** on any alert to get an AI-generated explanation "
+            "of why the traffic looks malicious (powered by Groq LLM)."
+        )
+        for row in recent:
+            alert_id = row.get("id", "?")
+            category = row.get("predicted_category", "Unknown")
+            severity = row.get("severity", "")
+            src_ip = row.get("src_ip", "")
+            ts = row.get("timestamp", "")[:19].replace("T", " ")
+            # Colour-code severity in the expander label
+            sev_icon = {
+                "Critical": "🔴", "High": "🟠", "Medium": "🟡",
+                "Low": "🟢", "Info": "🔵",
+            }.get(severity, "⚪")
+            label = (
+                f"{sev_icon} **#{alert_id}** — `{category}` — "
+                f"src: `{src_ip}` — {ts}"
+            )
+            with st.expander(label, expanded=False):
+                col_details, col_btn = st.columns([4, 1])
+                with col_details:
+                    st.json({
+                        k: row[k] for k in
+                        ["id", "timestamp", "src_ip", "dst_ip",
+                         "predicted_category", "confidence", "severity"]
+                        if k in row
+                    })
+                with col_btn:
+                    btn_key = f"explain_{alert_id}"
+                    if st.button("🤖 Explain", key=btn_key, use_container_width=True):
+                        with st.spinner("Asking Groq LLM..."):
+                            resp = api_get(f"/alerts/{alert_id}/explain")
+                        if resp:
+                            cached_label = " *(cached)*" if resp.get("cached") else ""
+                            st.info(
+                                f"**AI Explanation**{cached_label}\n\n"
+                                + resp.get("explanation", "No explanation returned."),
+                                icon="🛡️",
+                            )
 
     if st.button("🗑️ Clear Alert Log"):
         requests.delete(f"{API_URL}/alerts")
         st.rerun()
+

@@ -30,10 +30,16 @@ def init_db():
                 dst_ip TEXT,
                 predicted_category TEXT,
                 confidence REAL,
-                severity TEXT
+                severity TEXT,
+                explanation TEXT
             )
             """
         )
+        # Idempotent migration: add explanation column to pre-existing databases.
+        try:
+            conn.execute("ALTER TABLE alerts ADD COLUMN explanation TEXT")
+        except Exception:
+            pass  # Column already exists — safe to ignore.
         conn.commit()
         conn.close()
 
@@ -86,6 +92,29 @@ def get_alert_stats():
             "by_severity": {r["severity"]: r["c"] for r in by_severity},
             "top_sources": [dict(r) for r in top_sources],
         }
+
+
+def get_alert_by_id(alert_id: int) -> dict | None:
+    """Return a single alert row by primary key, or None if not found."""
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+
+def set_alert_explanation(alert_id: int, explanation: str) -> None:
+    """Persist an LLM-generated explanation for a given alert (cache)."""
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE alerts SET explanation = ? WHERE id = ?",
+            (explanation, alert_id),
+        )
+        conn.commit()
+        conn.close()
 
 
 def clear_alerts():
