@@ -48,6 +48,13 @@ jobs:
       - name: Run tests with coverage
         run: pytest api/tests/ -v --cov=api --cov-report=xml --cov-report=term-missing
 
+      - name: Upload model artifacts
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: models_store
+          path: models_store/
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         if: matrix.python-version == '3.12'
@@ -64,6 +71,12 @@ jobs:
     needs: lint-and-test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: models_store
+          path: models_store/
 
       - name: Build API image
         run: docker build -f Dockerfile.api -t nids-api:latest .
